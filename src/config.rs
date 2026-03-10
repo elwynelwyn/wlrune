@@ -1,7 +1,15 @@
-use std::{fs::File, io::Read, path::Path};
+use std::{
+    fs::File,
+    io::Read,
+    path::Path,
+    process::{Command, Stdio},
+};
 
 use serde::{Deserialize, Serialize};
 use serde_inline_default::serde_inline_default;
+
+const DEFAULT_TRAIL_COLOR: [u8; 4] = [255, 255, 255, 204];
+const DEFAULT_TRAIL_ALPHA: u8 = 204;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
@@ -11,6 +19,9 @@ pub struct AppConfig {
     /// Patterns that associated with commands (Pattern => Command)
     #[serde(default)]
     pub commands: Vec<GestureCommand>,
+    /// Visual trail rendering configuration
+    #[serde(default)]
+    pub trail: TrailConfig,
 }
 
 #[serde_inline_default]
@@ -44,6 +55,106 @@ pub struct RecognizerConfig {
 pub struct GestureCommand {
     pub pattern: String,
     pub command: String,
+}
+
+#[serde_inline_default]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrailConfig {
+    #[serde_inline_default(false)]
+    pub enabled: bool,
+    /// Trail color as "#rrggbb" or "#rrggbbaa" hex string.
+    /// When omitted, auto-detected from the XDG desktop portal accent color.
+    #[serde(default)]
+    pub color: Option<String>,
+    #[serde_inline_default(4.0)]
+    pub width: f64,
+}
+
+impl TrailConfig {
+    pub fn resolve_color(&self) -> [u8; 4] {
+        if let Some(ref hex) = self.color {
+            if let Some(c) = parse_hex_color(hex) {
+                return c;
+            }
+            eprintln!(
+                "WARNING: invalid trail color '{}', trying portal auto-detect",
+                hex
+            );
+        }
+        query_portal_accent_color().unwrap_or(DEFAULT_TRAIL_COLOR)
+    }
+}
+
+fn parse_hex_color(s: &str) -> Option<[u8; 4]> {
+    let s = s.strip_prefix('#')?;
+    match s.len() {
+        6 => {
+            let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+            let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+            let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+            Some([r, g, b, 255])
+        }
+        8 => {
+            let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+            let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+            let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+            let a = u8::from_str_radix(&s[6..8], 16).ok()?;
+            Some([r, g, b, a])
+        }
+        _ => None,
+    }
+}
+
+/// Query the XDG desktop portal for the user's accent color via busctl.
+/// Returns RGBA with a default alpha for overlay visibility.
+fn query_portal_accent_color() -> Option<[u8; 4]> {
+    let output = Command::new("busctl")
+        .args([
+            "--user",
+            "call",
+            "org.freedesktop.portal.Desktop",
+            "/org/freedesktop/portal/desktop",
+            "org.freedesktop.portal.Settings",
+            "ReadOne",
+            "ss",
+            "org.freedesktop.appearance",
+            "accent-color",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    // Output format: "v (ddd) 0.207843 0.517647 0.894118\n"
+    let text = String::from_utf8(output.stdout).ok()?;
+    let floats: Vec<f64> = text
+        .split_whitespace()
+        .filter_map(|s| s.parse::<f64>().ok())
+        .collect();
+
+    if floats.len() == 3 {
+        let r = (floats[0].clamp(0.0, 1.0) * 255.0) as u8;
+        let g = (floats[1].clamp(0.0, 1.0) * 255.0) as u8;
+        let b = (floats[2].clamp(0.0, 1.0) * 255.0) as u8;
+        eprintln!(
+            "trail: using portal accent color #{:02x}{:02x}{:02x}",
+            r, g, b
+        );
+        Some([r, g, b, DEFAULT_TRAIL_ALPHA])
+    } else {
+        None
+    }
+}
+
+impl Default for TrailConfig {
+    fn default() -> Self {
+        serde_yml::from_str("").unwrap()
+    }
 }
 
 impl AppConfig {

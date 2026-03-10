@@ -1,5 +1,6 @@
 mod config;
 mod recognizer;
+mod renderer;
 mod wayland;
 
 use std::{
@@ -76,7 +77,7 @@ fn main() -> Result<(), ()> {
                 .into_iter();
             let patterns = load_gestures(pattern_names).unwrap();
 
-            let Some(gesture_path) = get_user_gesture() else {
+            let Some(gesture_path) = get_user_gesture(config.trail.clone()) else {
                 return Ok(());
             };
 
@@ -137,7 +138,7 @@ fn main() -> Result<(), ()> {
                 return Err(());
             }
 
-            let Some(gesture_path) = get_user_gesture() else {
+            let Some(gesture_path) = get_user_gesture(config.trail.clone()) else {
                 return Ok(());
             };
 

@@ -64,6 +64,14 @@ commands:
     command: "firefox"
   - pattern: "down"
     command: "kitty"
+
+# Optional: render a visual trail following the cursor during gestures
+trail:
+    enabled: true
+    # Color as "#rrggbb" or "#rrggbbaa". When omitted, auto-detected from
+    # the XDG desktop portal accent color.
+    color: "#89b4facc"
+    width: 4
 ```
 
 Start recognition:

@@ -31,8 +31,16 @@ use wayland_client::{
 };
 
 use crate::recognizer::Point;
+use crate::config::TrailConfig;
+use crate::renderer;
 
-pub fn get_user_gesture() -> Option<Vec<Point>> {
+pub fn get_user_gesture(trail_config: TrailConfig) -> Option<Vec<Point>> {
+    let trail_color = if trail_config.enabled {
+        trail_config.resolve_color()
+    } else {
+        [0; 4]
+    };
+
     let conn = Connection::connect_to_env().unwrap();
 
     let (globals, mut event_queue) = registry_queue_init(&conn).unwrap();
@@ -58,6 +66,9 @@ pub fn get_user_gesture() -> Option<Vec<Point>> {
         keyboard: None,
         pointer: None,
 
+
+        trail_config,
+        trail_color,
         gesture_path: Vec::new(),
     };
 
@@ -96,15 +107,19 @@ struct AppData {
     keyboard: Option<wl_keyboard::WlKeyboard>,
     pointer: Option<wl_pointer::WlPointer>,
 
+
+    trail_config: TrailConfig,
+    trail_color: [u8; 4],
     gesture_path: Vec<Point>,
 }
 
-#[allow(dead_code)]
 struct OutputLayer {
     layer: LayerSurface,
     logical_size: (u32, u32),
     logical_position: (i32, i32),
     buffer: Option<Buffer>,
+    pixmap: Option<tiny_skia::Pixmap>,
+    dirty: bool,
 }
 
 impl CompositorHandler for AppData {
@@ -131,66 +146,74 @@ impl CompositorHandler for AppData {
     fn frame(
         &mut self,
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
+        qh: &QueueHandle<Self>,
+        surface: &wl_surface::WlSurface,
         _time: u32,
     ) {
-        //let Some(layer) = self
-        //    .layers
-        //    .iter_mut()
-        //    .find(|l| *l.layer.wl_surface() == *surface)
-        //else {
-        //    return;
-        //};
-        //
-        //let (width, height) = layer.logical_size;
-        //let stride = width as i32 * 4;
-        //
-        //let buffer = layer.buffer.get_or_insert_with(|| {
-        //    self.pool
-        //        .create_buffer(
-        //            width as i32,
-        //            height as i32,
-        //            stride,
-        //            wl_shm::Format::Argb8888,
-        //        )
-        //        .expect("create buffer")
-        //        .0
-        //});
-        //
-        //let mut canvas = match self.pool.canvas(buffer) {
-        //    Some(canvas) => canvas,
-        //    None => {
-        //        // This should be rare, but if the compositor has not released the previous
-        //        // buffer, we need double-buffering.
-        //        let (width, height) = layer.logical_size;
-        //        let (second_buffer, canvas) = self
-        //            .pool
-        //            .create_buffer(
-        //                width as i32,
-        //                height as i32,
-        //                stride,
-        //                wl_shm::Format::Argb8888,
-        //            )
-        //            .expect("create buffer");
-        //        *buffer = second_buffer;
-        //        canvas
-        //    }
-        //};
-        //
-        //canvas.write_all(layer.pixels.as_bytes()).unwrap();
-        //
-        //let wl_surface = layer.layer.wl_surface();
-        //
-        //// Damage the entire window
-        //wl_surface.damage_buffer(0, 0, width as i32, height as i32);
-        //// Request our next frame
-        //wl_surface.frame(qh, wl_surface.clone());
-        //// Attach and commit to present.
-        //buffer.attach_to(wl_surface).expect("buffer attach");
-        //layer.layer.commit();
-    }
+        if !self.trail_config.enabled {
+            return;
+        }
 
+        let Some(layer) = self
+            .layers
+            .iter_mut()
+            .find(|l| *l.layer.wl_surface() == *surface)
+        else {
+            return;
+        };
+
+        if !layer.dirty {
+            layer.layer.wl_surface().frame(qh, surface.clone());
+            layer.layer.commit();
+            return;
+        }
+
+        layer.dirty = false;
+
+        let (width, height) = layer.logical_size;
+        let stride = width as i32 * 4;
+
+        let Some(ref pixmap) = layer.pixmap else {
+            return;
+        };
+
+        let buffer = layer.buffer.get_or_insert_with(|| {
+            self.pool
+                .create_buffer(
+                    width as i32,
+                    height as i32,
+                    stride,
+                    wl_shm::Format::Argb8888,
+                )
+                .expect("create buffer")
+                .0
+        });
+
+        let canvas = match self.pool.canvas(buffer) {
+            Some(canvas) => canvas,
+            None => {
+                let (second_buffer, canvas) = self
+                    .pool
+                    .create_buffer(
+                        width as i32,
+                        height as i32,
+                        stride,
+                        wl_shm::Format::Argb8888,
+                    )
+                    .expect("create buffer");
+                *buffer = second_buffer;
+                canvas
+            }
+        };
+
+        renderer::rgba_to_argb(pixmap.data(), canvas);
+
+        let wl_surface = layer.layer.wl_surface();
+        wl_surface.damage_buffer(0, 0, width as i32, height as i32);
+        wl_surface.frame(qh, wl_surface.clone());
+        buffer.attach_to(wl_surface).expect("buffer attach");
+        layer.layer.commit();
+    }
     fn surface_enter(
         &mut self,
         _conn: &Connection,
@@ -243,15 +266,19 @@ impl OutputHandler for AppData {
         layer.set_size(logical_size.0, logical_size.1);
         layer.commit();
 
-        //let pixels: ImageBuffer<Rgba<u8>, Vec<u8>> =
-        //    ImageBuffer::new(logical_size.0, logical_size.1);
+        let pixmap = if self.trail_config.enabled {
+            tiny_skia::Pixmap::new(logical_size.0, logical_size.1)
+        } else {
+            None
+        };
 
         self.layers.push(OutputLayer {
             layer,
             logical_size,
             logical_position,
-            //pixels,
             buffer: None,
+            pixmap,
+            dirty: false,
         });
     }
 
@@ -459,20 +486,32 @@ impl PointerHandler for AppData {
 
                 let (x, y) = event.position;
 
-                //draw_circle(
-                //    &mut layer.pixels,
-                //    x as i32,
-                //    y as i32,
-                //    5,
-                //    Rgba::from([0xFF; 4]),
-                //);
 
-                //println!("mouse local position: x={}, y={}", x, y);
                 let global_x = layer.logical_position.0 as f64 + x;
                 let global_y = layer.logical_position.1 as f64 + y;
-                //println!("mouse global position: x={}, y={}", global_x, global_y);
 
                 self.gesture_path.push(Point::new(global_x, global_y));
+
+                if self.trail_config.enabled {
+                    let color = self.trail_color;
+                    let width = self.trail_config.width as f32;
+
+                    let local_points: Vec<Point> = self
+                        .gesture_path
+                        .iter()
+                        .map(|p| {
+                            Point::new(
+                                p.x - layer.logical_position.0 as f64,
+                                p.y - layer.logical_position.1 as f64,
+                            )
+                        })
+                        .collect();
+
+                    if let Some(ref mut pixmap) = layer.pixmap {
+                        renderer::render_trail(pixmap, &local_points, color, width);
+                        layer.dirty = true;
+                    }
+                }
             }
 
             if let PointerEventKind::Release { .. } = event.kind {
